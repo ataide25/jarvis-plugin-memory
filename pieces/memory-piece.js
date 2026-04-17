@@ -36,6 +36,13 @@ export class MemoryPiece {
 
     // Tool schema cache
     this.toolSchemas = new Map();
+
+    // Auto-save state
+    this.lastActivityAt = Date.now();
+    this.idleTimer = null;
+    this.IDLE_TIMEOUT_MS = 30 * 60 * 1000; // 30 minutes
+    this.lastCompactionSavedAt = null;
+    this.sessionMessageCount = 0;
   }
 
   // ── Piece Lifecycle ─────────────────────────────────────────────────────────
@@ -55,6 +62,7 @@ export class MemoryPiece {
       this._registerTools();
       this._publishHud();
       this._loadWakeUp().catch(() => {});
+      this._subscribeToEvents();
     } catch (e) {
       this._log("error", "Failed to start MemPalace: " + e.message);
       this._publishHud();
@@ -62,12 +70,126 @@ export class MemoryPiece {
   }
 
   async stop() {
+    this._clearIdleTimer();
     if (this.proc) {
       this.proc.kill();
       this.proc = null;
     }
     this.ready = false;
     this._removeHud();
+  }
+
+  // ── Event Subscriptions ─────────────────────────────────────────────────────
+
+  _subscribeToEvents() {
+    // 1. Listen for compaction via ai.stream — carries the full summary
+    this.bus.subscribe("ai.stream", async (msg) => {
+      // 1a. Compaction event → auto-save summary to palace
+      if (msg.event === "compaction" && msg.target === "main") {
+        await this._onCompaction(msg.compaction);
+      }
+
+      // 1b. Complete event → track activity + reset idle timer
+      if (msg.event === "complete" && msg.target === "main") {
+        this.lastActivityAt = Date.now();
+        this.sessionMessageCount++;
+        this._resetIdleTimer();
+      }
+    });
+
+    // 2. Listen for ai.request → reset idle timer on new user messages
+    this.bus.subscribe("ai.request", (msg) => {
+      if (msg.target === "main") {
+        this.lastActivityAt = Date.now();
+        this._resetIdleTimer();
+      }
+    });
+
+    this._log("info", "Subscribed to ai.stream (compaction + complete) and ai.request");
+  }
+
+  // ── Auto-save: Post-Compaction ───────────────────────────────────────────────
+
+  async _onCompaction(compaction) {
+    if (!this.ready || !compaction) return;
+
+    // Debounce: don't save twice within 60s for the same compaction event
+    const now = Date.now();
+    if (this.lastCompactionSavedAt && now - this.lastCompactionSavedAt < 60_000) return;
+    this.lastCompactionSavedAt = now;
+
+    this._log("info", `Compaction (${compaction.engine}) — auto-saving summary to palace`);
+
+    try {
+      const ts = new Date().toISOString().slice(0, 10);
+      const summary = compaction.summary
+        ? String(compaction.summary).slice(0, 2000)
+        : "(no summary available)";
+
+      const content = [
+        `[auto] Session compaction summary [${ts}]`,
+        `Engine: ${compaction.engine} | Context: ${compaction.tokensBefore ?? "?"}tok → ${compaction.tokensAfter ?? "?"}tok`,
+        `Messages in session: ~${this.sessionMessageCount}`,
+        ``,
+        summary,
+      ].join("\n");
+
+      await this._callTool("mempalace_add_drawer", {
+        content,
+        wing: "jarvis",
+        room: "sessions",
+        added_by: "jarvis-auto",
+      });
+
+      this.addCount++;
+      this._refreshStats().catch(() => {});
+      this._log("info", "Compaction summary saved to palace");
+    } catch (e) {
+      this._log("warn", "Failed to save compaction summary: " + e.message);
+    }
+  }
+
+  // ── Auto-save: Idle / Inactivity ─────────────────────────────────────────────
+
+  _resetIdleTimer() {
+    this._clearIdleTimer();
+    this.idleTimer = setTimeout(() => this._onIdle(), this.IDLE_TIMEOUT_MS);
+  }
+
+  _clearIdleTimer() {
+    if (this.idleTimer) {
+      clearTimeout(this.idleTimer);
+      this.idleTimer = null;
+    }
+  }
+
+  async _onIdle() {
+    if (!this.ready || this.sessionMessageCount === 0) return;
+
+    this._log("info", `Idle for ${this.IDLE_TIMEOUT_MS / 60000}min — auto-saving session snapshot`);
+
+    try {
+      const ts = new Date().toISOString().slice(0, 16).replace("T", " ");
+      const content = [
+        `Session idle snapshot [${ts}]`,
+        `Messages exchanged: ~${this.sessionMessageCount}`,
+        `Last activity: ${new Date(this.lastActivityAt).toISOString()}`,
+        `Memories in palace: ${this.stats.total_memories ?? 0}`,
+      ].join("\n");
+
+      await this._callTool("mempalace_add_drawer", {
+        content,
+        wing: "jarvis",
+        room: "sessions",
+        added_by: "jarvis-auto",
+      });
+
+      this.addCount++;
+      this._refreshStats().catch(() => {});
+      this._log("info", "Idle session snapshot saved to palace");
+    } catch (e) {
+      this._log("warn", "Failed to save idle snapshot: " + e.message);
+    }
   }
 
   systemContext(sessionId) {
