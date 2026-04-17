@@ -2,7 +2,7 @@
   "name": "jarvis-plugin-memory",
   "version": "1.0.0",
   "description": "Persistent semantic memory via ChromaDB — auto-save, auto-recall, knowledge graph for JARVIS and actors",
-  "author": "giovanibarili",
+  "author": "ataide25",
   "entry": "pieces/index.js",
   "capabilities": {
     "pieces": true
