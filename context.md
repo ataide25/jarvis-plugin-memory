@@ -1,43 +1,43 @@
-## Persistent Memory
+## Memory Palace
+Persistent semantic memory powered by [MemPalace](https://github.com/MemPalace/mempalace) — stored locally in ChromaDB, no API required.
 
-You have access to a persistent semantic memory system backed by ChromaDB (local, no API required).
+### Palace Structure
+Memory is organized hierarchically: **Wings → Rooms → Drawers**
 
-### Memory Architecture
-- **Collections**: `jarvis_memory` (main), `actor_memory` (per-actor)
-- **Storage**: `~/.jarvis/memory/` — ChromaDB persistent store
-- **Search**: Semantic (embedding-based) + metadata filters
+| Wing | Room | Content |
+|------|------|---------|
+| `user` | `preferences` | User preferences and likes |
+| `jarvis` | `decisions` | Architecture and product decisions |
+| `jarvis` | `sessions` | Session summaries and diary |
+| `jarvis` | `facts` | General facts |
+| `jarvis` | `tasks` | Task results |
+| `jarvis` | `conversations` | Notable exchanges |
+| `codebase` | `<project>` | Code patterns and solutions |
+| `codebase` | `errors` | Bugs and fixes |
+| `actors` | `<actor-name>` | Per-actor memory |
 
 ### Tools Available
-- `memory_search` — semantic search across all memories (use BEFORE answering questions about past conversations, decisions, code, preferences)
-- `memory_add` — save important information (use AFTER every significant decision, new preference, code pattern, or task completion)
-- `memory_delete` — remove outdated or incorrect memories
-- `memory_list` — list recent memories with filters
-- `memory_stats` — show memory system status
+- `memory_search` — semantic search (wraps `mempalace_search`)
+- `memory_add` — save to palace (wraps `mempalace_add_drawer`) — auto-routes to correct wing/room by type
+- `memory_delete` — delete a drawer by ID
+- `memory_list` — list drawers with wing/room filters
+- `memory_stats` — palace overview (wraps `mempalace_status`)
 
 ### When to Use Memory
 
 **Always search memory when:**
 - User asks about past conversations, decisions, or preferences
-- Starting a new session (search "recent context" for continuity)
-- Beginning a complex task (search for relevant past work)
+- Starting a new session (context is auto-injected on startup)
+- Beginning a complex task — search for relevant past work
 - User mentions something that might have been discussed before
 
 **Always save to memory when:**
 - User expresses a preference or decision
-- A task is completed (save the outcome)
-- Important code/architecture decisions are made
+- A task is completed — save the outcome
+- Important code or architecture decisions are made
 - New facts about the user, their projects, or their system are learned
-- A session ends with significant content (save a session summary)
-
-### Memory Metadata
-Use consistent tags for better retrieval:
-- `type`: `preference`, `decision`, `code`, `fact`, `session_summary`, `task_result`, `error`, `conversation`
-- `session`: session ID (e.g. `main`, `actor-researcher`)
-- `project`: project name if relevant
-- `importance`: `low`, `medium`, `high`, `critical`
 
 ### Actor Memory
-Each actor automatically has access to memory tools. Actors should:
+Each actor has its own room in the `actors` wing. Actors should:
 - Search memory at the start of each task for relevant context
-- Save task results to memory with their actor name as source
-- Use `session` metadata = their actor ID (e.g. `actor-researcher`)
+- Save task results with `type="task_result"` and their session as `source`

@@ -1,29 +1,39 @@
 # jarvis-plugin-memory
 
-Persistent semantic memory for [JARVIS](https://github.com/giovanibarili/jarvis-app) — backed by ChromaDB, fully local, no API required.
+Persistent semantic memory for [JARVIS](https://github.com/giovanibarili/jarvis-app) — powered by [MemPalace](https://github.com/MemPalace/mempalace), fully local, no API required.
 
-## What it does
+This plugin is a JARVIS wrapper around MemPalace. It spawns the MemPalace MCP server internally, bridges its tools into the JARVIS capability registry with familiar names (`memory_search`, `memory_add`, etc.), injects wake-up context into the system prompt, and renders a live HUD panel.
 
-- Stores memories in a local ChromaDB vector database (`~/.jarvis/memory/`)
-- Semantic search — find relevant memories by meaning, not just keywords
-- Per-session and per-actor memory isolation via metadata
-- Auto-injects recent context into the JARVIS system prompt on startup
-- HUD panel with memory stats, type breakdown donut, source tracking, and activity counters
-- Works for both JARVIS core and the actor pool
+## Architecture
 
----
+```
+JARVIS Core / Actor Pool
+        │
+        ▼
+ jarvis-plugin-memory
+  ├── memory_search  ──▶  mempalace_search
+  ├── memory_add     ──▶  mempalace_add_drawer  (auto wing/room routing)
+  ├── memory_delete  ──▶  mempalace_delete_drawer
+  ├── memory_list    ──▶  mempalace_list_drawers
+  └── memory_stats   ──▶  mempalace_status
+        │
+        ▼
+  MemPalace MCP Server (stdio subprocess)
+        │
+        ▼
+  ChromaDB + SQLite (~/.jarvis/palace/)
+```
 
 ## Requirements
 
 - Python 3.9+
-- `chromadb` Python package
+- `mempalace` Python package
 
 ```bash
-pip install chromadb
+pip install mempalace
 ```
 
-> **Note:** This plugin does NOT require MemPalace. It talks directly to ChromaDB.  
-> If you want to also use MemPalace for advanced memory features (knowledge graph, palace structure, MCP tools), see [Optional: MemPalace](#optional-mempalace) below.
+> **Note:** chromadb is installed automatically as a mempalace dependency.
 
 ---
 
@@ -35,131 +45,106 @@ pip install chromadb
 plugin_install github.com/ataide25/jarvis-plugin-memory
 ```
 
-JARVIS will clone the repo to `~/.jarvis/plugins/jarvis-plugin-memory` and load it automatically.
-
 ### Option B — Manual
 
 ```bash
-# 1. Clone the plugin
 git clone https://github.com/ataide25/jarvis-plugin-memory ~/.jarvis/plugins/jarvis-plugin-memory
-
-# 2. Add to ~/.jarvis/settings.user.json
 ```
+
+Add to `~/.jarvis/settings.user.json`:
 
 ```json
 {
   "plugins": {
     "jarvis-plugin-memory": {
       "enabled": true,
-      "path": "/Users/YOUR_USER/.jarvis/plugins/jarvis-plugin-memory",
+      "path": "~/.jarvis/plugins/jarvis-plugin-memory",
       "repo": "https://github.com/ataide25/jarvis-plugin-memory"
     }
   }
 }
 ```
 
+Restart JARVIS.
+
+---
+
+## Palace Setup
+
+The palace is initialized automatically at `~/.jarvis/palace/` on first use.
+
+To override the location:
+
 ```bash
-# 3. Restart JARVIS
+export JARVIS_PALACE_DIR=/custom/path/to/palace
 ```
 
 ---
 
-## Tools
+## Memory Tools
 
 | Tool | Description |
 |------|-------------|
-| `memory_search` | Semantic search across all memories |
-| `memory_add` | Save a memory with metadata (type, source, importance, tags) |
-| `memory_delete` | Delete a memory by ID |
-| `memory_list` | List memories with filters (type, session, source) |
-| `memory_stats` | Show storage stats and collection info |
+| `memory_search` | Semantic search — find memories by meaning |
+| `memory_add` | Save a memory — auto-routed to the correct wing/room by type |
+| `memory_delete` | Delete a memory by drawer ID |
+| `memory_list` | List memories with wing/room filters |
+| `memory_stats` | Palace overview — total drawers, wings, rooms |
+
+### Palace Structure
+
+Memory is organized as **Wings → Rooms → Drawers**:
+
+| Wing | Room | Memory type |
+|------|------|-------------|
+| `user` | `preferences` | Preferences |
+| `jarvis` | `decisions` | Architecture decisions |
+| `jarvis` | `sessions` | Session summaries |
+| `jarvis` | `facts` | General facts |
+| `jarvis` | `tasks` | Task results |
+| `jarvis` | `conversations` | Notable exchanges |
+| `codebase` | `<project>` | Code patterns |
+| `codebase` | `errors` | Bugs and fixes |
+| `actors` | `<actor-name>` | Per-actor memory |
 
 ### Example usage
 
 ```
-# Search for past decisions
-memory_search query="architecture decisions" type="decision"
-
 # Save a preference
 memory_add content="User prefers concise responses" type="preference" importance="high"
 
-# Save a task result
-memory_add content="Refactored the auth module — moved to JWT" type="task_result" project="myapp"
+# Save a decision
+memory_add content="Chose ChromaDB over Pinecone — local-first, no API key" type="decision" project="jarvis"
 
-# List recent memories
-memory_list limit=10 type="decision"
+# Save a task result from an actor
+memory_add content="Refactored auth module to JWT" type="task_result" source="actor-coder"
+
+# Search
+memory_search query="architecture decisions about database"
+
+# Browse recent memories
+memory_list wing="jarvis" room="decisions"
 ```
-
----
-
-## Memory Types
-
-Use consistent types for better retrieval:
-
-| Type | Description |
-|------|-------------|
-| `preference` | User preferences and likes |
-| `decision` | Architecture or product decisions |
-| `code` | Code patterns, snippets, solutions |
-| `fact` | General facts about the user, system, or projects |
-| `session_summary` | End-of-session summaries |
-| `task_result` | Outcomes from actor tasks |
-| `conversation` | Notable exchanges |
-| `error` | Bugs and their fixes |
 
 ---
 
 ## HUD Panel
 
 The memory panel shows:
-- **Status** — online/offline indicator and backend name
-- **Donut chart** — visual breakdown of memory types with percentages
-- **Collections** — list with memory counts
+- **Status** — online/offline, backend: mempalace
+- **Donut chart** — breakdown of memory types with percentages
+- **Collections/Wings** — with drawer counts
 - **Sources** — who saved memories (jarvis, actor names...)
 - **Activity counters** — searches and saves per session
-- **Last save** — relative timestamp of most recent memory
+- **Last save** — relative timestamp
 
 ---
 
 ## Storage
 
-All data is stored locally at `~/.jarvis/memory/` (ChromaDB persistent format).
-
-Override the path with the `JARVIS_MEMORY_DIR` environment variable:
-
-```bash
-export JARVIS_MEMORY_DIR=/custom/path/to/memory
-```
+All data lives at `~/.jarvis/palace/` (ChromaDB + SQLite, fully local).
 
 Nothing leaves your machine.
-
----
-
-## Optional: MemPalace
-
-This plugin uses ChromaDB directly and is fully self-contained.
-
-If you want **advanced memory features** — hierarchical structure (Wings → Rooms → Drawers), knowledge graph, 29 MCP tools, and 96.6% recall benchmarks — you can additionally install [MemPalace](https://github.com/MemPalace/mempalace):
-
-```bash
-pip install mempalace
-mempalace init ~/.mempalace/palace
-```
-
-Then add it as an MCP server in `~/.jarvis/mcp.json`:
-
-```json
-{
-  "mempalace": {
-    "type": "stdio",
-    "command": "python3",
-    "args": ["-m", "mempalace.mcp_server", "--palace", "/Users/YOUR_USER/.mempalace/palace"],
-    "autoConnect": true
-  }
-}
-```
-
-> MemPalace is independent of this plugin — both can run simultaneously.
 
 ---
 

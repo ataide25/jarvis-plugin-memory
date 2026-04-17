@@ -1,11 +1,15 @@
 // pieces/memory-piece.js
-// JARVIS Memory Piece — persistent semantic memory via ChromaDB
-// Manages the memory_server.py subprocess and exposes memory tools to JARVIS + actors.
+// JARVIS Memory Piece — wrapper around MemPalace MCP server (https://github.com/MemPalace/mempalace)
+// Spawns the MemPalace MCP subprocess, bridges its JSON-RPC protocol to JARVIS capability tools,
+// injects wake-up context into the system prompt, and drives the HUD panel.
 
 import { spawn } from "node:child_process";
-import { existsSync } from "node:fs";
-import { join } from "node:path";
 import { createInterface } from "node:readline";
+import { join } from "node:path";
+import { existsSync, mkdirSync } from "node:fs";
+import { homedir } from "node:os";
+
+const PALACE_DIR = process.env.JARVIS_PALACE_DIR ?? join(homedir(), ".jarvis", "palace");
 
 export class MemoryPiece {
   id = "memory";
@@ -16,14 +20,22 @@ export class MemoryPiece {
     this.bus = null;
     this.proc = null;
     this.ready = false;
-    this.pendingRequests = new Map(); // id → { resolve, reject }
-    this.requestCounter = 0;
+    this.initialized = false;
+
+    // JSON-RPC state
+    this.rpcCounter = 0;
+    this.pending = new Map(); // id → { resolve, reject }
+    this.buffer = "";
+
+    // HUD data
     this.wakeUpContext = "";
     this.stats = { total_memories: 0, collections: [] };
     this.metrics = { types: {}, sources: {}, lastSaved: null };
     this.searchCount = 0;
     this.addCount = 0;
-    this.scriptPath = join(ctx.pluginDir, "scripts", "memory_server.py");
+
+    // Tool schema cache
+    this.toolSchemas = new Map();
   }
 
   // ── Piece Lifecycle ─────────────────────────────────────────────────────────
@@ -31,17 +43,22 @@ export class MemoryPiece {
   async start(bus) {
     this.bus = bus;
 
-    if (!existsSync(this.scriptPath)) {
-      this._log("warn", "memory_server.py not found at: " + this.scriptPath);
-      return;
+    // Ensure palace dir exists
+    if (!existsSync(PALACE_DIR)) {
+      mkdirSync(PALACE_DIR, { recursive: true });
     }
 
-    await this._startServer();
-    this._registerTools();
-    this._publishHud();
-
-    // Load wake-up context asynchronously
-    this._loadWakeUp().catch(() => {});
+    try {
+      await this._startMcpServer();
+      await this._mcpInitialize();
+      await this._loadToolSchemas();
+      this._registerTools();
+      this._publishHud();
+      this._loadWakeUp().catch(() => {});
+    } catch (e) {
+      this._log("error", "Failed to start MemPalace: " + e.message);
+      this._publishHud();
+    }
   }
 
   async stop() {
@@ -55,23 +72,27 @@ export class MemoryPiece {
 
   systemContext(sessionId) {
     if (!this.ready) return "";
-    const total = this.stats.total_memories ?? 0;
-    if (total === 0) return "";
 
-    let ctx = `## Memory System\nPersistent semantic memory active. ${total} memories stored locally in ChromaDB.\n`;
+    const total = this.stats.total_memories ?? 0;
+    const palaceDir = PALACE_DIR;
+
+    let ctx = `## Memory Palace\nPersistent semantic memory active. ${total} memories stored locally in MemPalace (ChromaDB).\n`;
+    ctx += `Palace: ${palaceDir}\n`;
+
     if (this.wakeUpContext) {
       ctx += "\n" + this.wakeUpContext;
     }
+
     return ctx;
   }
 
-  // ── Server Management ───────────────────────────────────────────────────────
+  // ── MCP Server ──────────────────────────────────────────────────────────────
 
-  async _startServer() {
+  async _startMcpServer() {
     return new Promise((resolve, reject) => {
-      this._log("info", "Starting memory server...");
+      this._log("info", `Starting MemPalace MCP server — palace: ${PALACE_DIR}`);
 
-      this.proc = spawn("python3", [this.scriptPath], {
+      this.proc = spawn("python3", ["-m", "mempalace.mcp_server", "--palace", PALACE_DIR], {
         stdio: ["pipe", "pipe", "pipe"],
         env: {
           ...process.env,
@@ -80,152 +101,129 @@ export class MemoryPiece {
         },
       });
 
+      // MemPalace MCP uses newline-delimited JSON (stdio transport)
       const rl = createInterface({ input: this.proc.stdout });
-
-      rl.on("line", (line) => {
-        if (!line.trim()) return;
-        try {
-          const msg = JSON.parse(line);
-
-          // First message is the ready signal
-          if (msg.status === "ready") {
-            this.ready = true;
-            this._log("info", `Memory server ready. Dir: ${msg.memory_dir}`);
-            resolve();
-            return;
-          }
-
-          // Subsequent messages are RPC responses
-          const pending = this.pendingRequests.get(msg.id);
-          if (pending) {
-            this.pendingRequests.delete(msg.id);
-            if (msg.result?.error) {
-              pending.reject(new Error(msg.result.error));
-            } else {
-              pending.resolve(msg.result);
-            }
-          }
-        } catch (e) {
-          this._log("warn", "Invalid JSON from server: " + line.slice(0, 100));
-        }
-      });
+      rl.on("line", (line) => this._onMcpLine(line));
 
       this.proc.stderr.on("data", (data) => {
-        // Suppress chromadb telemetry noise
         const text = data.toString();
-        if (!text.includes("telemetry") && !text.includes("DeprecationWarning") && !text.includes("capture()")) {
-          this._log("debug", "server stderr: " + text.slice(0, 200));
+        // Suppress telemetry noise
+        if (!text.includes("telemetry") && !text.includes("capture()") && !text.includes("DeprecationWarning")) {
+          this._log("debug", "stderr: " + text.slice(0, 200).trim());
         }
       });
 
       this.proc.on("exit", (code) => {
         this.ready = false;
-        this._log("warn", `Memory server exited with code ${code}`);
-        // Reject all pending requests
-        for (const [, pending] of this.pendingRequests) {
-          pending.reject(new Error("Memory server exited"));
-        }
-        this.pendingRequests.clear();
+        this._log("warn", `MemPalace exited: ${code}`);
+        for (const [, p] of this.pending) p.reject(new Error("MemPalace server exited"));
+        this.pending.clear();
+        this._updateHud();
       });
 
-      this.proc.on("error", (err) => {
-        this._log("error", "Failed to start memory server: " + err.message);
-        reject(err);
-      });
+      this.proc.on("error", (err) => reject(err));
 
-      // Timeout if server doesn't start in 15s
-      setTimeout(() => {
-        if (!this.ready) {
-          reject(new Error("Memory server startup timeout"));
-        }
-      }, 15000);
+      // The process is ready when it starts (no explicit ready signal in MCP stdio)
+      setTimeout(() => resolve(), 800);
     });
   }
 
-  async _call(action, params = {}) {
-    if (!this.ready || !this.proc) {
-      throw new Error("Memory server not ready");
+  _onMcpLine(line) {
+    if (!line.trim()) return;
+    try {
+      const msg = JSON.parse(line);
+      const id = msg.id;
+      if (id !== undefined && this.pending.has(id)) {
+        const { resolve, reject } = this.pending.get(id);
+        this.pending.delete(id);
+        if (msg.error) reject(new Error(msg.error.message ?? JSON.stringify(msg.error)));
+        else resolve(msg.result ?? {});
+      }
+    } catch (e) {
+      this._log("debug", "Non-JSON line: " + line.slice(0, 100));
     }
-    const id = String(++this.requestCounter);
+  }
+
+  _rpc(method, params = {}) {
     return new Promise((resolve, reject) => {
-      this.pendingRequests.set(id, { resolve, reject });
-      const req = JSON.stringify({ id, action, params }) + "\n";
-      this.proc.stdin.write(req);
-      // Timeout per request
+      if (!this.proc) return reject(new Error("MemPalace not running"));
+      const id = ++this.rpcCounter;
+      this.pending.set(id, { resolve, reject });
+      const msg = JSON.stringify({ jsonrpc: "2.0", id, method, params }) + "\n";
+      this.proc.stdin.write(msg);
       setTimeout(() => {
-        if (this.pendingRequests.has(id)) {
-          this.pendingRequests.delete(id);
-          reject(new Error(`Memory request timeout: ${action}`));
+        if (this.pending.has(id)) {
+          this.pending.delete(id);
+          reject(new Error(`RPC timeout: ${method}`));
         }
       }, 30000);
     });
   }
 
-  async _loadWakeUp() {
-    try {
-      const result = await this._call("stats", {});
-      this.stats = result;
-
-      if (result.total_memories > 0) {
-        const [wakeUp, metrics] = await Promise.all([
-          this._call("wake_up", { limit: 8 }),
-          this._call("metrics", {}),
-        ]);
-        this.wakeUpContext = wakeUp.context ?? "";
-        this.metrics = metrics;
-      }
-
-      this._updateHud();
-    } catch (e) {
-      this._log("warn", "Wake-up load failed: " + e.message);
-    }
+  async _mcpInitialize() {
+    await this._rpc("initialize", {
+      protocolVersion: "2024-11-05",
+      capabilities: {},
+      clientInfo: { name: "jarvis", version: "1.0" },
+    });
+    // Send initialized notification
+    this.proc.stdin.write(JSON.stringify({ jsonrpc: "2.0", method: "notifications/initialized", params: {} }) + "\n");
+    this.initialized = true;
+    this.ready = true;
+    this._log("info", "MemPalace MCP initialized");
   }
 
-  async _refreshMetrics() {
+  async _loadToolSchemas() {
+    const result = await this._rpc("tools/list", {});
+    for (const tool of result.tools ?? []) {
+      this.toolSchemas.set(tool.name, tool);
+    }
+    this._log("info", `Loaded ${this.toolSchemas.size} MemPalace tools`);
+  }
+
+  async _callTool(name, args = {}) {
+    const result = await this._rpc("tools/call", { name, arguments: args });
+    // MCP tool results are in result.content[0].text (text blocks)
+    const content = result.content ?? [];
+    const text = content.map(c => c.text ?? "").join("\n").trim();
     try {
-      const [stats, metrics] = await Promise.all([
-        this._call("stats", {}),
-        this._call("metrics", {}),
-      ]);
-      this.stats = stats;
-      this.metrics = metrics;
-      this._updateHud();
-    } catch (e) {
-      // silent
+      return JSON.parse(text);
+    } catch {
+      return { text };
     }
   }
 
   // ── Tool Registration ───────────────────────────────────────────────────────
+  // Expose a curated set of MemPalace tools directly in JARVIS CapabilityRegistry
+  // with JARVIS-friendly names and descriptions.
 
   _registerTools() {
     const registry = this.ctx.capabilityRegistry;
 
-    // memory_search
+    // ── memory_search → mempalace_search ─────────────────────────────────────
     registry.register({
       name: "memory_search",
-      description: "Semantic search across persistent memory. Use before answering questions about past conversations, decisions, preferences, or any information that might have been saved previously.",
+      description: "Semantic search across persistent memory (MemPalace). Use before answering questions about past conversations, decisions, preferences, or any information that might have been saved previously.",
       input_schema: {
         type: "object",
         properties: {
-          query: { type: "string", description: "Search query — natural language description of what to find" },
-          limit: { type: "number", description: "Max results to return (default: 5, max: 20)" },
-          type: { type: "string", description: "Filter by memory type: preference, decision, code, fact, session_summary, task_result, conversation" },
-          session: { type: "string", description: "Filter by session ID (e.g. 'main', 'actor-researcher')" },
-          source: { type: "string", description: "Filter by source (e.g. 'jarvis', actor name)" },
-          collection: { type: "string", description: "Collection name (default: jarvis_memory)" },
+          query: { type: "string", description: "Natural language search query" },
+          limit: { type: "number", description: "Max results (default: 5)" },
+          wing: { type: "string", description: "Filter by wing (e.g. 'jarvis', 'user', 'codebase')" },
+          room: { type: "string", description: "Filter by room within a wing" },
+          collection: { type: "string", description: "Ignored — kept for API compatibility" },
+          session: { type: "string", description: "Ignored — use wing/room for filtering" },
+          source: { type: "string", description: "Ignored — use wing/room for filtering" },
+          type: { type: "string", description: "Ignored — use wing/room for filtering" },
         },
         required: ["query"],
       },
       handler: async (input) => {
         try {
-          const result = await this._call("search", {
-            query: input.query,
-            limit: input.limit ?? 5,
-            type: input.type,
-            session: input.session,
-            source: input.source,
-            collection: input.collection ?? "jarvis_memory",
-          });
+          const args = { query: String(input.query), limit: Number(input.limit ?? 5) };
+          if (input.wing) args.wing = input.wing;
+          if (input.room) args.room = input.room;
+          const result = await this._callTool("mempalace_search", args);
           this.searchCount++;
           this._updateHud();
           return result;
@@ -235,10 +233,10 @@ export class MemoryPiece {
       },
     });
 
-    // memory_add
+    // ── memory_add → mempalace_add_drawer ────────────────────────────────────
     registry.register({
       name: "memory_add",
-      description: "Save information to persistent memory. Use for important facts, decisions, preferences, code patterns, task outcomes, and session summaries. Information persists across restarts.",
+      description: "Save information to persistent memory (MemPalace). Use for important facts, decisions, preferences, code patterns, task outcomes, and session summaries.",
       input_schema: {
         type: "object",
         properties: {
@@ -248,34 +246,31 @@ export class MemoryPiece {
           session: { type: "string", description: "Session ID this memory is from" },
           importance: { type: "string", description: "Memory importance: low, medium, high, critical" },
           project: { type: "string", description: "Project name if relevant" },
-          tags: { type: "array", items: { type: "string" }, description: "List of tags for categorization" },
-          collection: { type: "string", description: "Collection name (default: jarvis_memory)" },
-          id: { type: "string", description: "Custom ID — if provided, updates existing memory with same ID" },
+          tags: { type: "array", items: { type: "string" }, description: "Tags for categorization" },
+          collection: { type: "string", description: "Ignored — kept for API compatibility" },
+          id: { type: "string", description: "Ignored — MemPalace manages IDs internally" },
         },
         required: ["content"],
       },
       handler: async (input) => {
-        // Determine source from session ID if not provided
-        const sessionId = input.__sessionId;
-        const source = input.source ?? (sessionId?.startsWith("actor-") ? sessionId.replace("actor-", "") : "jarvis");
-
         try {
-          const result = await this._call("add", {
-            content: input.content,
-            type: input.type ?? "fact",
-            source,
-            session: input.session ?? sessionId ?? "main",
-            importance: input.importance ?? "medium",
-            project: input.project,
-            tags: input.tags,
-            collection: input.collection ?? "jarvis_memory",
-            id: input.id,
-          });
+          const sessionId = input.__sessionId ?? "main";
+          const source = input.source ?? (sessionId.startsWith("actor-") ? sessionId : "jarvis");
+          const type = input.type ?? "fact";
 
-          // Refresh stats + metrics after adding
+          // Map JARVIS memory types to MemPalace wing/room structure
+          const { wing, room } = this._typeToWingRoom(type, source, input.project);
+
+          const args = {
+            content: String(input.content),
+            wing,
+            room,
+            added_by: source,
+          };
+
+          const result = await this._callTool("mempalace_add_drawer", args);
           this.addCount++;
-          this._refreshMetrics().catch(() => {});
-
+          this._refreshStats().catch(() => {});
           return result;
         } catch (e) {
           return { error: e.message };
@@ -283,31 +278,28 @@ export class MemoryPiece {
       },
     });
 
-    // memory_delete
+    // ── memory_delete → mempalace_delete_drawer ──────────────────────────────
     registry.register({
       name: "memory_delete",
       description: "Delete a memory by ID. Use to remove outdated or incorrect memories.",
       input_schema: {
         type: "object",
         properties: {
-          id: { type: "string", description: "Memory ID to delete" },
-          collection: { type: "string", description: "Collection name (default: jarvis_memory)" },
+          id: { type: "string", description: "Memory/drawer ID to delete" },
+          collection: { type: "string", description: "Ignored" },
         },
         required: ["id"],
       },
       handler: async (input) => {
         try {
-          return await this._call("delete", {
-            id: input.id,
-            collection: input.collection ?? "jarvis_memory",
-          });
+          return await this._callTool("mempalace_delete_drawer", { drawer_id: String(input.id) });
         } catch (e) {
           return { error: e.message };
         }
       },
     });
 
-    // memory_list
+    // ── memory_list → mempalace_list_drawers ─────────────────────────────────
     registry.register({
       name: "memory_list",
       description: "List memories with optional filters. Use to browse what's stored or find memories by metadata.",
@@ -316,49 +308,157 @@ export class MemoryPiece {
         properties: {
           limit: { type: "number", description: "Max results (default: 20)" },
           offset: { type: "number", description: "Pagination offset" },
-          type: { type: "string", description: "Filter by type" },
-          session: { type: "string", description: "Filter by session" },
-          source: { type: "string", description: "Filter by source" },
-          collection: { type: "string", description: "Collection name (default: jarvis_memory)" },
+          wing: { type: "string", description: "Filter by wing" },
+          room: { type: "string", description: "Filter by room" },
+          type: { type: "string", description: "Ignored — use wing/room" },
+          session: { type: "string", description: "Ignored — use wing/room" },
+          source: { type: "string", description: "Ignored — use wing/room" },
+          collection: { type: "string", description: "Ignored" },
         },
         required: [],
       },
       handler: async (input) => {
         try {
-          return await this._call("list", {
-            limit: input.limit ?? 20,
-            offset: input.offset ?? 0,
-            type: input.type,
-            session: input.session,
-            source: input.source,
-            collection: input.collection ?? "jarvis_memory",
-          });
+          const args = { limit: Number(input.limit ?? 20) };
+          if (input.wing) args.wing = input.wing;
+          if (input.room) args.room = input.room;
+          return await this._callTool("mempalace_list_drawers", args);
         } catch (e) {
           return { error: e.message, items: [] };
         }
       },
     });
 
-    // memory_stats
+    // ── memory_stats → mempalace_status ──────────────────────────────────────
     registry.register({
       name: "memory_stats",
-      description: "Show memory system status — total memories, collections, storage location.",
-      input_schema: {
-        type: "object",
-        properties: {},
-        required: [],
-      },
+      description: "Show memory system status — total drawers, wings, rooms, palace location.",
+      input_schema: { type: "object", properties: {}, required: [] },
       handler: async () => {
         try {
-          const result = await this._call("stats", {});
-          this.stats = result;
-          this._updateHud();
+          const result = await this._callTool("mempalace_status", {});
+          await this._refreshStats();
           return result;
         } catch (e) {
           return { error: e.message };
         }
       },
     });
+  }
+
+  // ── Wing/Room Mapping ───────────────────────────────────────────────────────
+  // Maps JARVIS memory types to MemPalace hierarchical structure
+
+  _typeToWingRoom(type, source, project) {
+    // Actor sources go to their own wing
+    if (source && source.startsWith("actor-")) {
+      const actorName = source.replace("actor-", "");
+      return { wing: "actors", room: actorName };
+    }
+
+    const map = {
+      preference:      { wing: "user",     room: "preferences" },
+      decision:        { wing: "jarvis",   room: "decisions" },
+      code:            { wing: "codebase", room: project ?? "general" },
+      fact:            { wing: "jarvis",   room: "facts" },
+      session_summary: { wing: "jarvis",   room: "sessions" },
+      task_result:     { wing: "jarvis",   room: "tasks" },
+      conversation:    { wing: "jarvis",   room: "conversations" },
+      error:           { wing: "codebase", room: "errors" },
+    };
+
+    return map[type] ?? { wing: "jarvis", room: "general" };
+  }
+
+  // ── Stats & Wake-up ─────────────────────────────────────────────────────────
+
+  async _loadWakeUp() {
+    try {
+      // Get palace status for HUD
+      const status = await this._callTool("mempalace_status", {});
+      this.stats.total_memories = status.total_drawers ?? 0;
+      this.stats.collections = [];
+
+      // Get taxonomy for type breakdown
+      const taxonomy = await this._callTool("mempalace_get_taxonomy", {});
+      this._buildMetricsFromTaxonomy(taxonomy);
+
+      // Wake-up context: recent diary entries + quick status
+      if (this.stats.total_memories > 0) {
+        try {
+          const diary = await this._callTool("mempalace_diary_read", { limit: 5 });
+          const search = await this._callTool("mempalace_search", { query: "recent context session summary", limit: 5 });
+          this.wakeUpContext = this._buildWakeUpContext(status, diary, search);
+        } catch { /* diary might be empty */ }
+      }
+
+      this._updateHud();
+    } catch (e) {
+      this._log("warn", "Wake-up failed: " + e.message);
+    }
+  }
+
+  async _refreshStats() {
+    try {
+      const status = await this._callTool("mempalace_status", {});
+      this.stats.total_memories = status.total_drawers ?? 0;
+      const taxonomy = await this._callTool("mempalace_get_taxonomy", {});
+      this._buildMetricsFromTaxonomy(taxonomy);
+      this._updateHud();
+    } catch { /* silent */ }
+  }
+
+  _buildMetricsFromTaxonomy(taxonomy) {
+    // taxonomy shape: { wings: { wing_name: { rooms: { room_name: count } } } }
+    const types = {};
+    const sources = {};
+
+    if (taxonomy?.wings) {
+      for (const [wing, wingData] of Object.entries(taxonomy.wings)) {
+        const rooms = wingData?.rooms ?? {};
+        for (const [room, count] of Object.entries(rooms)) {
+          // Reverse-map wing/room back to a "type" label for the HUD
+          const label = this._wingRoomToLabel(wing, room);
+          types[label] = (types[label] ?? 0) + (count ?? 0);
+          sources[wing] = (sources[wing] ?? 0) + (count ?? 0);
+        }
+      }
+    }
+
+    this.metrics = { types, sources, lastSaved: new Date().toISOString() };
+  }
+
+  _wingRoomToLabel(wing, room) {
+    if (wing === "user") return "preference";
+    if (wing === "actors") return "task_result";
+    if (wing === "codebase" && room === "errors") return "error";
+    if (wing === "codebase") return "code";
+    if (room === "decisions") return "decision";
+    if (room === "sessions") return "session_summary";
+    if (room === "tasks") return "task_result";
+    if (room === "conversations") return "conversation";
+    return "fact";
+  }
+
+  _buildWakeUpContext(status, diary, search) {
+    const lines = [];
+    lines.push(`## Memory Palace — ${status.total_drawers ?? 0} drawers, ${status.wing_count ?? 0} wings`);
+
+    if (diary?.entries?.length > 0) {
+      lines.push("\n### Recent Diary");
+      for (const entry of diary.entries.slice(0, 3)) {
+        lines.push(`- ${entry.content?.slice(0, 200) ?? ""}`);
+      }
+    }
+
+    if (search?.results?.length > 0) {
+      lines.push("\n### Relevant Context");
+      for (const r of search.results.slice(0, 3)) {
+        lines.push(`- [${r.wing ?? "?"}/${r.room ?? "?"}] ${r.content?.slice(0, 200) ?? ""}`);
+      }
+    }
+
+    return lines.join("\n");
   }
 
   // ── HUD ─────────────────────────────────────────────────────────────────────
@@ -375,8 +475,8 @@ export class MemoryPiece {
         name: "Memory",
         status: "running",
         data: this._getHudData(),
-        position: { x: 10, y: 160 },
-        size: { width: 220, height: 310 },
+        position: { x: 240, y: 110 },
+        size: { width: 240, height: 320 },
       },
     });
   }
@@ -413,16 +513,17 @@ export class MemoryPiece {
       lastSaved: this.metrics.lastSaved ?? null,
       searchCount: this.searchCount,
       addCount: this.addCount,
+      backend: "mempalace",
+      palaceDir: PALACE_DIR,
     };
   }
 
   // ── Logging ─────────────────────────────────────────────────────────────────
 
   _log(level, msg) {
-    const levels = { debug: 0, info: 1, warn: 2, error: 3 };
-    const prefix = `[MemoryPiece]`;
+    const prefix = "[MemoryPiece]";
     if (level === "error") console.error(prefix, msg);
     else if (level === "warn") console.warn(prefix, msg);
-    else console.log(prefix, msg);
+    else if (level !== "debug") console.log(prefix, msg);
   }
 }
