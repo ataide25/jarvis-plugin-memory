@@ -1,6 +1,6 @@
 # jarvis-plugin-memory
 
-Persistent semantic memory for [JARVIS](https://github.com/ataide25/jarvis-app) — backed by ChromaDB, fully local, no API required.
+Persistent semantic memory for [JARVIS](https://github.com/giovanibarili/jarvis-app) — backed by ChromaDB, fully local, no API required.
 
 ## What it does
 
