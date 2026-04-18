@@ -5,6 +5,7 @@
   "author": "ataide25",
   "entry": "pieces/index.js",
   "capabilities": {
-    "pieces": true
+    "pieces": true,
+    "renderers": true
   }
 }

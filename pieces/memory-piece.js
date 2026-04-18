@@ -599,6 +599,7 @@ export class MemoryPiece {
         data: this._getHudData(),
         position: { x: 240, y: 110 },
         size: { width: 240, height: 320 },
+        renderer: { plugin: "jarvis-plugin-memory", file: "MemoryRenderer" },
       },
     });
   }
